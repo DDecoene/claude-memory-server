@@ -1,0 +1,13 @@
+services:
+  memory:
+    build: .
+    # Bind to localhost only — Tailscale Funnel connects here,
+    # port is never directly exposed to the internet
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      # Store the database on the USB SSD for persistence and speed
+      - /mnt/ssd/claude-memory:/data
+    restart: unless-stopped
+    env_file:
+      - .env
