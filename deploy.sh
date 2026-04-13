@@ -1,49 +1,68 @@
 #!/usr/bin/env bash
-# Deploy the memory server to the Raspberry Pi.
-# Prerequisites on the Pi: Docker, docker compose, USB SSD mounted at /mnt/ssd
+# Deploy the memory server to the Raspberry Pi (bare metal, systemd).
 #
 # Usage:
-#   PI_HOST=pi@raspberrypi.local ./deploy.sh
-#   PI_HOST=pi@100.x.x.x ./deploy.sh     # via Tailscale IP
+#   ./deploy.sh                                      # default host
+#   PI_HOST=dennis@192.168.0.203 ./deploy.sh
+#   PI_SSH_KEY=~/.ssh/arthur-ledger ./deploy.sh
 set -euo pipefail
 
-PI_HOST="${PI_HOST:-pi@raspberrypi.local}"
-REMOTE_DIR="/opt/claude-memory"
+PI_HOST="${PI_HOST:-dennis@192.168.0.203}"
+PI_SSH_KEY="${PI_SSH_KEY:-$HOME/.ssh/arthur-ledger}"
+SSH="ssh -i $PI_SSH_KEY"
+RSYNC_SSH="ssh -i $PI_SSH_KEY"
+REMOTE_DIR="/home/dennis/claude-memory"
+SERVICE="claude-memory"
 
 echo "▶ Deploying to $PI_HOST..."
 
-# Ensure the SSD mount point and data dir exist on the Pi
-ssh "$PI_HOST" "sudo mkdir -p /mnt/ssd/claude-memory && sudo chown \$USER /mnt/ssd/claude-memory"
+# Ensure remote dir exists
+$SSH "$PI_HOST" "mkdir -p $REMOTE_DIR"
 
-# Sync source files (excluding local .env — never copy secrets over rsync blindly)
+# Sync source files
 rsync -av --delete \
+    -e "$RSYNC_SSH" \
     --exclude='.env' \
     --exclude='__pycache__' \
     --exclude='*.pyc' \
+    --exclude='.venv' \
+    --exclude='data/' \
     . "$PI_HOST:$REMOTE_DIR/"
 
-# If .env doesn't exist on the Pi yet, warn and create from example
-ssh "$PI_HOST" "
+# Ensure .env exists on Pi
+$SSH "$PI_HOST" "
     if [ ! -f $REMOTE_DIR/.env ]; then
         cp $REMOTE_DIR/.env.example $REMOTE_DIR/.env
         echo ''
         echo '⚠️  Created $REMOTE_DIR/.env from .env.example'
-        echo '   Edit it now and set MEMORY_API_KEY before starting:'
-        echo '   ssh $PI_HOST nano $REMOTE_DIR/.env'
+        echo '   Set MEMORY_API_KEY before the service will start:'
+        echo '   nano $REMOTE_DIR/.env'
         echo ''
         exit 1
     fi
 "
 
-# Build and restart
-ssh "$PI_HOST" "cd $REMOTE_DIR && docker compose up -d --build"
+# Install/sync dependencies into .venv
+$SSH "$PI_HOST" "
+    cd $REMOTE_DIR
+    ~/.local/bin/uv sync
+"
+
+# Install systemd service if not present, then restart
+$SSH "$PI_HOST" "
+    sudo cp $REMOTE_DIR/claude-memory.service /etc/systemd/system/$SERVICE.service
+    sudo systemctl daemon-reload
+    sudo systemctl enable $SERVICE
+    sudo systemctl restart $SERVICE
+"
 
 echo ""
 echo "✓ Deployed. Checking health..."
-sleep 3
-ssh "$PI_HOST" "curl -sf http://localhost:8765/health && echo ' ← server is up'"
+sleep 2
+$SSH "$PI_HOST" "curl -sf http://localhost:8765/health && echo ' ← server is up'"
 
 echo ""
-echo "Next: ensure Tailscale Funnel is running on the Pi:"
-echo "  ssh $PI_HOST 'sudo tailscale funnel 8765'"
-echo "  ssh $PI_HOST 'tailscale status'   # note your public URL"
+echo "If first deploy, connect Tailscale and enable Funnel:"
+echo "  $SSH $PI_HOST 'sudo tailscale up'"
+echo "  $SSH $PI_HOST 'sudo tailscale funnel 8765'"
+echo "  $SSH $PI_HOST 'tailscale status'"

@@ -155,9 +155,14 @@ def update_profile(content: str) -> dict:
     Replace the entire user profile with new content.
     The old profile is deleted; only the latest matters.
     """
+    mid = _new_id()
     with db() as c:
         c.execute("DELETE FROM memories WHERE type='profile'")
-    return store_memory(content, "profile")
+        c.execute(
+            "INSERT INTO memories VALUES (?,?,?,?,?,?)",
+            (mid, "profile", content, "[]", None, datetime.utcnow().isoformat()),
+        )
+    return {"id": mid, "stored": True}
 
 
 @mcp.tool()
