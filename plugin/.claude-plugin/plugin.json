@@ -1,0 +1,10 @@
+{
+  "name": "claude-memory",
+  "version": "0.2.0",
+  "description": "Automatic session memory for Claude Code. Captures tool use and prompts, injects relevant context at session start.",
+  "author": {
+    "name": "Dennis Decoene"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/dennisdecoene/claude-memory-server"
+}
