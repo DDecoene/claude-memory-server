@@ -41,7 +41,7 @@ def init_db() -> None:
             );
 
             CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts
-                USING fts5(content, content=observations, content_rowid=rowid);
+                USING fts5(content);
 
             CREATE TRIGGER IF NOT EXISTS obs_ai AFTER INSERT ON observations BEGIN
                 INSERT INTO obs_fts(rowid, content) VALUES (new.rowid, new.content);
@@ -98,11 +98,8 @@ async def session_start(request: Request, _=Depends(check_auth)):
     if project:
         with db() as c:
             rows = c.execute(
-                """SELECT o.content FROM observations o
-                   JOIN obs_fts ON o.rowid = obs_fts.rowid
-                   WHERE obs_fts MATCH ? AND o.project = ?
-                   ORDER BY rank LIMIT 5""",
-                (project.replace("/", " ").strip(), project),
+                "SELECT content FROM observations WHERE project = ? ORDER BY created_at DESC LIMIT 5",
+                (project,),
             ).fetchall()
         if not rows:
             # Fall back: just grab the 5 most recent for this project
