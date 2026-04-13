@@ -1,7 +1,6 @@
 """
-Claude Memory MCP Server
-Runs on Raspberry Pi, exposed publicly via Tailscale Funnel.
-Stores and retrieves personal memories across all Claude Code sessions.
+claude-memory REST server
+Hook-driven memory capture for Claude Code.
 """
 import json
 import os
@@ -10,19 +9,18 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
-from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-from starlette.routing import Mount, Route
+from fastapi import FastAPI, Request, Response, HTTPException, Depends
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-# ── Config ────────────────────────────────────────────────────────────────────
 DB_PATH = Path(os.environ.get("DB_PATH", "/data/memories.db"))
-API_KEY = os.environ.get("MEMORY_API_KEY", "")
+SECRET = os.environ.get("MEMORY_SECRET", "")
 
-# ── Database ──────────────────────────────────────────────────────────────────
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+app = FastAPI()
+
+
+# ── Database ──────────────────────────────────────────────────────────────────
 
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -33,214 +31,131 @@ def db() -> sqlite3.Connection:
 def init_db() -> None:
     with db() as c:
         c.executescript("""
-            CREATE TABLE IF NOT EXISTS memories (
+            CREATE TABLE IF NOT EXISTS observations (
                 id         TEXT PRIMARY KEY,
-                type       TEXT NOT NULL,
-                content    TEXT NOT NULL,
-                tags       TEXT NOT NULL DEFAULT '[]',
+                session_id TEXT NOT NULL,
+                hook_type  TEXT NOT NULL,
                 project    TEXT,
+                content    TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
 
-            CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts
-                USING fts5(content, content=memories, content_rowid=rowid);
+            CREATE VIRTUAL TABLE IF NOT EXISTS obs_fts
+                USING fts5(content, content=observations, content_rowid=rowid);
 
-            -- Keep FTS index in sync with the main table
-            CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-                INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
+            CREATE TRIGGER IF NOT EXISTS obs_ai AFTER INSERT ON observations BEGIN
+                INSERT INTO obs_fts(rowid, content) VALUES (new.rowid, new.content);
             END;
-            CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, content)
-                    VALUES ('delete', old.rowid, old.content);
-                INSERT INTO memories_fts(rowid, content) VALUES (new.rowid, new.content);
-            END;
-            CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-                INSERT INTO memories_fts(memories_fts, rowid, content)
+            CREATE TRIGGER IF NOT EXISTS obs_ad AFTER DELETE ON observations BEGIN
+                INSERT INTO obs_fts(obs_fts, rowid, content)
                     VALUES ('delete', old.rowid, old.content);
             END;
+
+            CREATE TABLE IF NOT EXISTS sessions (
+                id         TEXT PRIMARY KEY,
+                project    TEXT,
+                started_at TEXT NOT NULL,
+                ended_at   TEXT
+            );
         """)
 
 
 init_db()
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _row(r: sqlite3.Row) -> dict:
-    return {
-        "id":         r["id"],
-        "type":       r["type"],
-        "content":    r["content"],
-        "tags":       json.loads(r["tags"]),
-        "project":    r["project"],
-        "created_at": r["created_at"],
-    }
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+def check_auth(request: Request):
+    if not SECRET:
+        return
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer ") or auth[7:] != SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _new_id() -> str:
-    return str(uuid.uuid4())[:8]
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "service": "claude-memory"}
 
 
-# ── MCP tools ─────────────────────────────────────────────────────────────────
-mcp = FastMCP("claude-memory")
+@app.post("/session/start")
+async def session_start(request: Request, _=Depends(check_auth)):
+    body = await request.json()
+    session_id = body.get("session_id") or f"ses_{uuid.uuid4().hex[:8]}"
+    project = body.get("cwd") or body.get("project") or ""
 
-
-@mcp.tool()
-def store_memory(
-    content: str,
-    memory_type: str,
-    tags: list[str] = [],
-    project: str | None = None,
-) -> dict:
-    """
-    Persist a memory.
-
-    memory_type options:
-      - "profile"  : long-term facts about the user (overwritten by update_profile)
-      - "session"  : compressed summary of a work session
-      - "decision" : an architectural or technical decision with rationale
-      - "fact"     : a discrete fact learned (e.g. "project X uses pattern Y")
-    """
-    mid = _new_id()
+    # Register session
     with db() as c:
         c.execute(
-            "INSERT INTO memories VALUES (?,?,?,?,?,?)",
-            (mid, memory_type, content, json.dumps(tags), project, datetime.utcnow().isoformat()),
+            "INSERT OR IGNORE INTO sessions VALUES (?,?,?,?)",
+            (session_id, project, datetime.utcnow().isoformat(), None),
         )
-    return {"id": mid, "stored": True}
 
-
-@mcp.tool()
-def search_memories(
-    query: str,
-    limit: int = 5,
-    memory_type: str | None = None,
-) -> list[dict]:
-    """
-    Full-text search across stored memories using SQLite FTS5.
-    Returns results ranked by relevance.
-    """
-    with db() as c:
-        if memory_type:
-            rows = c.execute(
-                """SELECT m.* FROM memories m
-                   JOIN memories_fts ON m.rowid = memories_fts.rowid
-                   WHERE memories_fts MATCH ? AND m.type = ?
-                   ORDER BY rank LIMIT ?""",
-                (query, memory_type, limit),
-            ).fetchall()
-        else:
-            rows = c.execute(
-                """SELECT m.* FROM memories m
-                   JOIN memories_fts ON m.rowid = memories_fts.rowid
-                   WHERE memories_fts MATCH ?
-                   ORDER BY rank LIMIT ?""",
-                (query, limit),
-            ).fetchall()
-    return [_row(r) for r in rows]
-
-
-@mcp.tool()
-def get_profile() -> str:
-    """Return the current user profile (most recent profile entry)."""
-    with db() as c:
-        row = c.execute(
-            "SELECT content FROM memories WHERE type='profile' ORDER BY created_at DESC LIMIT 1"
-        ).fetchone()
-    return row["content"] if row else "No profile stored yet. Call update_profile() to create one."
-
-
-@mcp.tool()
-def update_profile(content: str) -> dict:
-    """
-    Replace the entire user profile with new content.
-    The old profile is deleted; only the latest matters.
-    """
-    mid = _new_id()
-    with db() as c:
-        c.execute("DELETE FROM memories WHERE type='profile'")
-        c.execute(
-            "INSERT INTO memories VALUES (?,?,?,?,?,?)",
-            (mid, "profile", content, "[]", None, datetime.utcnow().isoformat()),
-        )
-    return {"id": mid, "stored": True}
-
-
-@mcp.tool()
-def get_recent_sessions(n: int = 5) -> list[dict]:
-    """Return the n most recent session summaries, newest first."""
-    with db() as c:
-        rows = c.execute(
-            "SELECT * FROM memories WHERE type='session' ORDER BY created_at DESC LIMIT ?",
-            (n,),
-        ).fetchall()
-    return [_row(r) for r in rows]
-
-
-@mcp.tool()
-def list_memories(
-    memory_type: str | None = None,
-    project: str | None = None,
-    limit: int = 20,
-) -> list[dict]:
-    """List memories with optional filters. Newest first."""
-    q, p = "SELECT * FROM memories WHERE 1=1", []
-    if memory_type:
-        q += " AND type=?"
-        p.append(memory_type)
+    # FTS search recent observations for this project
+    context = ""
     if project:
-        q += " AND project=?"
-        p.append(project)
-    q += " ORDER BY created_at DESC LIMIT ?"
-    p.append(limit)
+        with db() as c:
+            rows = c.execute(
+                """SELECT o.content FROM observations o
+                   JOIN obs_fts ON o.rowid = obs_fts.rowid
+                   WHERE obs_fts MATCH ? AND o.project = ?
+                   ORDER BY rank LIMIT 5""",
+                (project.replace("/", " ").strip(), project),
+            ).fetchall()
+        if not rows:
+            # Fall back: just grab the 5 most recent for this project
+            with db() as c:
+                rows = c.execute(
+                    "SELECT content FROM observations WHERE project=? ORDER BY created_at DESC LIMIT 5",
+                    (project,),
+                ).fetchall()
+        if rows:
+            snippets = "\n---\n".join(r["content"] for r in rows)
+            context = f"[Memory context for {project}]\n{snippets}\n[End memory context]\n\n"
+
+    return PlainTextResponse(context)
+
+
+@app.post("/observe")
+async def observe(request: Request, _=Depends(check_auth)):
+    body = await request.json()
+    hook_type = body.get("hookType", "unknown")
+    session_id = body.get("sessionId", "unknown")
+    project = body.get("project") or body.get("cwd") or ""
+    data = body.get("data", {})
+
+    # Flatten data to a readable string for FTS
+    content_parts = [f"hook:{hook_type}", f"session:{session_id}"]
+    if project:
+        content_parts.append(f"project:{project}")
+    for k, v in data.items():
+        if v:
+            val = v if isinstance(v, str) else json.dumps(v)
+            content_parts.append(f"{k}: {val[:2000]}")  # cap per field
+
+    content = "\n".join(content_parts)
+
     with db() as c:
-        rows = c.execute(q, p).fetchall()
-    return [_row(r) for r in rows]
+        c.execute(
+            "INSERT INTO observations VALUES (?,?,?,?,?,?)",
+            (uuid.uuid4().hex[:8], session_id, hook_type, project or None,
+             content, datetime.utcnow().isoformat()),
+        )
+
+    return {"stored": True}
 
 
-# ── Auth middleware ───────────────────────────────────────────────────────────
+@app.post("/session/end")
+async def session_end(request: Request, _=Depends(check_auth)):
+    body = await request.json()
+    session_id = body.get("sessionId", "unknown")
 
-class ApiKeyGuard:
-    """
-    ASGI middleware: rejects requests without a valid X-API-Key header.
-    /health is always allowed (used by Tailscale Funnel health checks).
-    If MEMORY_API_KEY env var is not set, auth is skipped entirely.
-    """
+    with db() as c:
+        c.execute(
+            "UPDATE sessions SET ended_at=? WHERE id=?",
+            (datetime.utcnow().isoformat(), session_id),
+        )
 
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or not API_KEY:
-            await self.app(scope, receive, send)
-            return
-
-        if scope.get("path") == "/health":
-            await self.app(scope, receive, send)
-            return
-
-        headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers", [])}
-        if headers.get("x-api-key") != API_KEY:
-            await Response("Unauthorized", status_code=401)(scope, receive, send)
-            return
-
-        await self.app(scope, receive, send)
-
-
-# ── HTTP routes ───────────────────────────────────────────────────────────────
-
-async def health(request: Request):
-    return JSONResponse({"status": "ok", "service": "claude-memory"})
-
-
-# ── App assembly ──────────────────────────────────────────────────────────────
-# MCP tools are served at /mcp/sse  (SSE transport)
-# Configure Claude Code with: "url": "https://YOUR-PI.ts.net/mcp/sse"
-
-app = ApiKeyGuard(
-    Starlette(
-        routes=[
-            Route("/health", health),
-            Mount("/mcp", app=mcp.sse_app()),
-        ]
-    )
-)
+    return {"ok": True}
